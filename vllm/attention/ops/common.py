@@ -184,7 +184,7 @@ def cp_lse_ag_out_rs(
 
     if ctx is None:
         ctx = CPTritonContext()
-
+    print("Fan-debug: ", cp_attn_lse.shape)
     lses = torch.empty(
         (cp_group.world_size,) + cp_attn_lse.shape,
         dtype=cp_attn_lse.dtype,
@@ -303,7 +303,7 @@ def pack_seq_triton(
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
     )
 
     # Reshape output back to original dimensions (except first dimension)
@@ -403,7 +403,7 @@ def unpack_seq_triton(
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
     )
 
     # Reshape output back to original dimensions (except first dimension)

@@ -235,6 +235,7 @@ class RocmPlatform(Platform):
             from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
                 is_aiter_mla_enabled,
             )
+            print("Fan-debug: ", is_aiter_mla_enabled())
 
             if selected_backend is None:
                 selected_backend = (

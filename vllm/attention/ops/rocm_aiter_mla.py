@@ -34,7 +34,7 @@ def aiter_mla_decode_fwd(
     kv_last_page_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
 ):
-    torch.ops.vllm.rocm_aiter_mla_decode_fwd(
+    lse = torch.ops.vllm.rocm_aiter_mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -46,6 +46,7 @@ def aiter_mla_decode_fwd(
         sm_scale=sm_scale,
         logit_cap=logit_cap,
     )
+    return lse
 
 
 def mla_decode_fwd_impl(
@@ -59,10 +60,10 @@ def mla_decode_fwd_impl(
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
+) -> torch.Tensor:
     from aiter.mla import mla_decode_fwd
 
-    mla_decode_fwd(
+    _, lse = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -74,6 +75,7 @@ def mla_decode_fwd_impl(
         sm_scale=sm_scale,
         logit_cap=logit_cap,
     )
+    return lse
 
 
 def mla_decode_fwd_fake(
@@ -87,8 +89,14 @@ def mla_decode_fwd_fake(
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
+) -> torch.Tensor:
     pass
+    # Return a fake lse tensor with appropriate shape
+    # lse shape should be [batch_size, num_heads]
+    batch_size = qo_indptr.shape[0] - 1
+    num_heads = q.shape[1] if q.dim() > 1 else 1
+    return torch.empty(batch_size, num_heads, dtype=q.dtype, device=q.device)
+    return torch.empty(batch_size, num_heads, dtype=q.dtype, device=q.device)
 
 
 if current_platform.is_rocm():
