@@ -294,10 +294,10 @@ def _rocm_aiter_mla_decode_fwd_impl(
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
+) -> torch.Tensor:
     from aiter.mla import mla_decode_fwd
 
-    mla_decode_fwd(
+    _, lse = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -309,6 +309,7 @@ def _rocm_aiter_mla_decode_fwd_impl(
         sm_scale=sm_scale,
         logit_cap=logit_cap,
     )
+    return lse
 
 
 def _rocm_aiter_mla_decode_fwd_fake(
@@ -322,8 +323,11 @@ def _rocm_aiter_mla_decode_fwd_fake(
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
-) -> None:
-    pass
+) -> torch.Tensor:
+    batch_size = qo_indptr.shape[0] - 1
+    num_heads = q.shape[1] if q.dim() > 1 else 1
+    return torch.empty(batch_size, num_heads, dtype=q.dtype, device=q.device)
+    # pass
 
 
 def _rocm_aiter_gemm_a8w8_impl(
@@ -807,7 +811,7 @@ class rocm_aiter_ops:
         kv_last_page_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
     ):
-        torch.ops.vllm.rocm_aiter_mla_decode_fwd(
+        lse = torch.ops.vllm.rocm_aiter_mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -819,6 +823,7 @@ class rocm_aiter_ops:
             sm_scale=sm_scale,
             logit_cap=logit_cap,
         )
+        return lse
 
     @staticmethod
     def triton_fp4_gemm_dynamic_qaunt(
