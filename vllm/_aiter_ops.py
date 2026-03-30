@@ -392,12 +392,14 @@ def _rocm_aiter_mla_decode_fwd_impl(
     reduce_indptr: torch.Tensor | None = None,
     reduce_final_map: torch.Tensor | None = None,
     reduce_partial_map: torch.Tensor | None = None,
-) -> None:
+    return_lse: bool = False,
+) -> torch.Tensor:
     from aiter.mla import mla_decode_fwd
 
-    kwargs: dict[str, float | torch.Tensor | None] = {
+    kwargs: dict[str, float | bool | torch.Tensor | None] = {
         "sm_scale": sm_scale,
         "logit_cap": logit_cap,
+        "return_lse": return_lse,
     }
 
     # Only pass q_scale and kv_scale if the aiter library supports them
@@ -428,7 +430,7 @@ def _rocm_aiter_mla_decode_fwd_impl(
         kwargs["reduce_final_map"] = reduce_final_map
         kwargs["reduce_partial_map"] = reduce_partial_map
 
-    mla_decode_fwd(
+    _logits, lse = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -439,6 +441,11 @@ def _rocm_aiter_mla_decode_fwd_impl(
         max_seqlen_qo,
         **kwargs,
     )
+    # Custom op schema does not support Tensor | None return type.
+    # Return an empty tensor as a sentinel when LSE is not requested.
+    if lse is None:
+        return torch.empty(0, dtype=torch.float32, device=o.device)
+    return lse
 
 
 def _rocm_aiter_mla_decode_fwd_fake(
@@ -460,8 +467,12 @@ def _rocm_aiter_mla_decode_fwd_fake(
     reduce_indptr: torch.Tensor | None = None,
     reduce_final_map: torch.Tensor | None = None,
     reduce_partial_map: torch.Tensor | None = None,
-) -> None:
-    pass
+    return_lse: bool = False,
+) -> torch.Tensor:
+    if return_lse:
+        total_s, nhead, _v_head_dim = o.shape
+        return torch.empty((total_s, nhead), dtype=torch.float32, device=o.device)
+    return torch.empty(0, dtype=torch.float32, device=o.device)
 
 
 def _rocm_aiter_gemm_a8w8_impl(
@@ -1700,8 +1711,9 @@ class rocm_aiter_ops:
         reduce_indptr: torch.Tensor | None = None,
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
-    ):
-        torch.ops.vllm.rocm_aiter_mla_decode_fwd(
+        return_lse: bool = False,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -1720,6 +1732,7 @@ class rocm_aiter_ops:
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            return_lse=return_lse,
         )
 
     @staticmethod

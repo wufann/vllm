@@ -132,6 +132,15 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         self._num_attention_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        # The aiter MLA kernel requires at least 16 heads and operates on the
+        # AllGathered query when DCP is active. Compute the effective head count
+        # that will actually be passed to the kernel:
+        #   - With DCP: local_heads * dcp_world_size (AllGather expands heads)
+        #   - Without DCP but local_heads < 16: pad up to 16
+        self._kernel_num_attention_heads = max(
+            self._num_attention_heads * dcp_world_size, 16
+        )
         q_dtype = self.decode_attn_out_dtype
         kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
         if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
@@ -149,7 +158,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         ) = get_mla_metadata_info_v1(
             max_num_reqs,
             1,
-            self._num_attention_heads,
+            self._kernel_num_attention_heads,
             q_dtype,
             kv_dtype,
             is_sparse=False,
@@ -250,7 +259,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             qo_indptr,
             paged_kv_indptr,
             paged_kv_last_page_len,
-            self._num_attention_heads,
+            self._kernel_num_attention_heads,
             1,
             True,
             self._mla_work_meta_data,
@@ -328,6 +337,8 @@ def _copy_page_indices_kernel(
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -365,8 +376,9 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             f"Provided {num_heads} number of heads.\n"
             "Try adjusting tensor_parallel_size value."
         )
-        self._needs_head_repeat = num_heads < 16
-        self._head_repeat_factor = 16 // num_heads if num_heads < 16 else 1
+        # Note: head padding is computed dynamically in forward_mqa based on
+        # q.shape[1] to correctly handle the DCP case where q has been
+        # AllGathered before forward_mqa is called.
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
@@ -407,13 +419,20 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
-        B = q.shape[0]
+        B, actual_num_heads = q.shape[0], q.shape[1]
 
-        if self._needs_head_repeat:
-            q = q.repeat_interleave(self._head_repeat_factor, dim=1)
+        # When DCP is active, q has already been AllGathered across DCP ranks
+        # (in mla_attention.py) before forward_mqa is called, so q.shape[1]
+        # equals num_heads * dcp_world_size rather than the local TP num_heads.
+        # Determine head-repeat at runtime based on the actual incoming heads
+        # to avoid incorrectly padding an already-gathered query.
+        if actual_num_heads < 16:
+            head_repeat_factor = 16 // actual_num_heads
+            q = q.repeat_interleave(head_repeat_factor, dim=1)
             kernel_num_heads = 16
         else:
-            kernel_num_heads = self.num_heads
+            head_repeat_factor = 1
+            kernel_num_heads = actual_num_heads
 
         o = torch.zeros(
             B,
@@ -425,7 +444,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        rocm_aiter_ops.mla_decode_fwd(
+        lse_or_empty = rocm_aiter_ops.mla_decode_fwd(
             q,
             kv_buffer,
             o,
@@ -443,9 +462,16 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             reduce_indptr=attn_metadata.reduce_indptr,
             reduce_final_map=attn_metadata.reduce_final_map,
             reduce_partial_map=attn_metadata.reduce_partial_map,
+            return_lse=self.need_to_return_lse_for_decode,
+        )
+        # lse_or_empty is an empty tensor (shape [0]) when LSE is not needed.
+        lse: torch.Tensor | None = (
+            lse_or_empty if self.need_to_return_lse_for_decode else None
         )
 
-        if self._needs_head_repeat:
-            o = o[:, :: self._head_repeat_factor, :]
+        if head_repeat_factor > 1:
+            o = o[:, ::head_repeat_factor, :]
+            if lse is not None:
+                lse = lse[:, ::head_repeat_factor]
 
-        return o, None
+        return o, lse
